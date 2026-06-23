@@ -8,13 +8,14 @@ return new class extends Migration
 {
     public function up(): void
     {
-        Schema::create('sop_progress_harians', function (Blueprint $table) {
+        if (Schema::hasTable('sop_progress_harians')) {
+            return;
+        }
 
+        Schema::create('sop_progress_harians', function (Blueprint $table) {
             $table->id();
 
-            $table->foreignId('patroli_harian_id')
-                ->constrained()
-                ->cascadeOnDelete();
+            $table->unsignedBigInteger('patroli_harian_id');
 
             $table->foreignId('sop_id')
                 ->constrained('sops')
@@ -43,6 +44,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        Schema::dropIfExists('sop_progress');
+        Schema::dropIfExists('sop_progress_harians');
     }
 };
