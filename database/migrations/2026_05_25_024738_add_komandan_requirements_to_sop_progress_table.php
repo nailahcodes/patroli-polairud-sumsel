@@ -8,16 +8,12 @@ return new class extends Migration
 {
     public function up(): void
     {
-        if (!Schema::hasTable('sop_progress')) {
-            return;
-        }
-
         Schema::table('sop_progress', function (Blueprint $table) {
-            if (!Schema::hasColumn('sop_progress', 'checklist_sarpras')) {
+            if (! Schema::hasColumn('sop_progress', 'checklist_sarpras')) {
                 $table->json('checklist_sarpras')->nullable()->after('catatan');
             }
 
-            if (!Schema::hasColumn('sop_progress', 'bukti_file')) {
+            if (! Schema::hasColumn('sop_progress', 'bukti_file')) {
                 $table->string('bukti_file')->nullable()->after('checklist_sarpras');
             }
         });
@@ -25,10 +21,6 @@ return new class extends Migration
 
     public function down(): void
     {
-        if (!Schema::hasTable('sop_progress')) {
-            return;
-        }
-
         Schema::table('sop_progress', function (Blueprint $table) {
             if (Schema::hasColumn('sop_progress', 'checklist_sarpras')) {
                 $table->dropColumn('checklist_sarpras');
