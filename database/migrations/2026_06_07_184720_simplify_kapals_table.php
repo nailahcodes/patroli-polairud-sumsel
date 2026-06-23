@@ -6,25 +6,24 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
-    /**
-     * Run the migrations.
-     */
     public function up(): void
     {
         Schema::table('kapals', function (Blueprint $table) {
-
-            $table->dropColumn([
-                'kelompok',
-                'zona_patroli',
-                'wilayah_patroli',
-                'komandan_kapal',
-            ]);
+            if (Schema::hasColumn('kapals', 'kelompok')) {
+                $table->dropColumn('kelompok');
+            }
+            if (Schema::hasColumn('kapals', 'zona_patroli')) {
+                $table->dropColumn('zona_patroli');
+            }
+            if (Schema::hasColumn('kapals', 'wilayah_patroli')) {
+                $table->dropColumn('wilayah_patroli');
+            }
+            if (Schema::hasColumn('kapals', 'komandan_kapal')) {
+                $table->dropColumn('komandan_kapal');
+            }
         });
     }
 
-    /**
-     * Reverse the migrations.
-     */
     public function down(): void
     {
         //
