@@ -1,0 +1,1052 @@
+abklaporancontroller.php:
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\AbkLaporan;
+use App\Models\Patroli;
+use App\Models\RiksaKapal;
+use Barryvdh\DomPDF\Facade\Pdf;
+use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use iio\libmergepdf\Merger;
+
+class AbkLaporanController extends Controller
+{
+    private array $anggaranItems = [
+        'Uang Lauk Pauk (ULP)',
+        'Uang Saku Komandan Kapal',
+        'Uang Saku (Pa Nautika)',
+        'Uang Saku (Pa Teknika)',
+        'Uang Saku (ABK)',
+        'Uang Saku Air Tawar',
+    ];
+
+    private array $logistikItems = [
+        'Pertamax',
+        'Prima XP',
+        'Rored EPA',
+    ];
+
+    private array $lampiranPdf = [
+        'absensi_personel',
+        'daftar_nama_personel',
+        'berita_acara_penyerahan_materil',
+    ];
+
+    public function index()
+    {
+        $user = auth()->user();
+
+        if ($user->role !== 'abk') {
+            abort(403, 'Menu arsip laporan hanya untuk ABK Kapal.');
+        }
+
+        $laporans = AbkLaporan::with('patroli.kapal')
+            ->where('user_id', $user->id)
+            ->latest()
+            ->paginate(10);
+
+        return view('abk-laporan.index', compact('laporans'));
+    }
+
+    public function edit(Patroli $patroli)
+    {
+        $this->ensureAbkCanAccess($patroli);
+
+        $laporan = AbkLaporan::firstOrCreate(
+            ['patroli_id' => $patroli->id],
+            [
+                'user_id' => auth()->id(),
+                'status' => 'draft',
+            ]
+        );
+
+        foreach ($this->anggaranItems as $item) {
+            $laporan->anggarans()->firstOrCreate(
+                ['komponen' => $item],
+                ['nominal' => 0]
+            );
+        }
+
+        foreach ($this->logistikItems as $item) {
+            $laporan->logistiks()->firstOrCreate(
+                ['jenis' => $item],
+                ['jumlah_liter' => 0]
+            );
+        }
+
+        $laporan->koordinats()->firstOrCreate(
+            ['jenis' => 'bertolak'],
+            ['koordinat' => null]
+        );
+
+        $laporan->koordinats()->firstOrCreate(
+            ['jenis' => 'bersandar'],
+            ['koordinat' => null]
+        );
+
+        $laporan->load([
+            'patroli.kapal.komandan',
+            'patroli.personels',
+            'patroli.sopProgress.sop',
+            'anggarans',
+            'logistiks',
+            'koordinats',
+            'riksaKapals',
+            'lampirans',
+        ]);
+
+        return view('abk-laporan.edit', compact('laporan', 'patroli'));
+    }
+
+    public function update(Request $request, Patroli $patroli)
+    {
+        $this->ensureAbkCanAccess($patroli);
+
+        $laporan = AbkLaporan::firstOrCreate(
+            ['patroli_id' => $patroli->id],
+            [
+                'user_id' => auth()->id(),
+                'status' => 'draft',
+            ]
+        );
+
+        $request->validate([
+            'anggaran' => ['nullable', 'array'],
+            'anggaran.*' => ['nullable', 'numeric', 'min:0'],
+
+            'logistik' => ['nullable', 'array'],
+            'logistik.*' => ['nullable', 'numeric', 'min:0'],
+
+            'koordinat_bertolak' => ['nullable', 'string', 'max:255'],
+            'koordinat_bersandar' => ['nullable', 'string', 'max:255'],
+
+            'total_pengisian_bbm' => ['nullable', 'numeric', 'min:0'],
+            'total_stock_bbm_tangki' => ['nullable', 'numeric', 'min:0'],
+            'total_jarak_tempuh' => ['nullable', 'numeric', 'min:0'],
+            'total_pemakaian_bbm' => ['nullable', 'numeric', 'min:0'],
+            'pemakaian_bbm_selama_layar' => ['nullable', 'numeric', 'min:0'],
+            'kecepatan_rata_rata' => ['nullable', 'numeric', 'min:0'],
+            'sisa_bbm_selesai_patroli' => ['nullable', 'numeric', 'min:0'],
+
+            'riksa' => ['nullable', 'array'],
+            'riksa.*.id' => ['nullable', 'exists:riksa_kapals,id'],
+            'riksa.*.nama_kapal' => ['nullable', 'string', 'max:255'],
+            'riksa.*.nama_nahkoda' => ['nullable', 'string', 'max:255'],
+            'riksa.*.dari_tujuan' => ['nullable', 'string', 'max:255'],
+            'riksa.*.muatan' => ['nullable', 'string', 'max:255'],
+            'riksa.*.titik_koordinat' => ['nullable', 'string', 'max:255'],
+            'riksa.*.kategori' => ['nullable', 'in:aman,tindak_pidana,pelanggaran'],
+            'riksa.*.penjelasan' => ['nullable', 'string'],
+
+            'riksa.*.foto_riksa' => ['nullable', 'image', 'mimes:jpg,jpeg,png', 'max:5120'],
+            'riksa.*.foto_binluh' => ['nullable', 'image', 'mimes:jpg,jpeg,png', 'max:5120'],
+            'riksa.*.surat_hasil_pemeriksaan' => ['nullable', 'file', 'mimes:pdf', 'max:5120'],
+
+            'lampiran.absensi_personel' => ['nullable', 'file', 'mimes:pdf', 'max:5120'],
+            'lampiran.daftar_nama_personel' => ['nullable', 'file', 'mimes:pdf', 'max:5120'],
+            'lampiran.berita_acara_penyerahan_materil' => ['nullable', 'file', 'mimes:pdf', 'max:5120'],
+            'lampiran.foto_pengisian_air_tawar' => ['nullable', 'image', 'mimes:jpg,jpeg,png', 'max:5120'],
+        ]);
+
+        DB::transaction(function () use ($request, $laporan, $patroli) {
+            foreach ($this->anggaranItems as $item) {
+                $laporan->anggarans()->updateOrCreate(
+                    ['komponen' => $item],
+                    ['nominal' => $request->input('anggaran.' . $this->key($item), 0)]
+                );
+            }
+
+            foreach ($this->logistikItems as $item) {
+                $laporan->logistiks()->updateOrCreate(
+                    ['jenis' => $item],
+                    ['jumlah_liter' => $request->input('logistik.' . $this->key($item), 0)]
+                );
+            }
+
+            $laporan->koordinats()->updateOrCreate(
+                ['jenis' => 'bertolak'],
+                ['koordinat' => $request->koordinat_bertolak]
+            );
+
+            $laporan->koordinats()->updateOrCreate(
+                ['jenis' => 'bersandar'],
+                ['koordinat' => $request->koordinat_bersandar]
+            );
+
+            $laporan->update([
+                'total_pengisian_bbm' => $request->total_pengisian_bbm ?? 0,
+                'total_stock_bbm_tangki' => $request->total_stock_bbm_tangki ?? 0,
+                'total_jarak_tempuh' => $request->total_jarak_tempuh ?? 0,
+                'total_pemakaian_bbm' => $request->total_pemakaian_bbm ?? 0,
+                'pemakaian_bbm_selama_layar' => $request->pemakaian_bbm_selama_layar ?? 0,
+                'kecepatan_rata_rata' => $request->kecepatan_rata_rata ?? 0,
+                'sisa_bbm_selesai_patroli' => $request->sisa_bbm_selesai_patroli ?? 0,
+                'status' => 'tersimpan',
+                'user_id' => auth()->id(),
+            ]);
+
+            $this->syncRiksaKapals($request, $laporan);
+
+            foreach ($this->lampiranPdf as $jenis) {
+                if ($request->hasFile("lampiran.$jenis")) {
+                    $path = $request->file("lampiran.$jenis")
+                        ->store('lampiran-abk', 'public');
+
+                    $this->replaceLampiran($laporan, $jenis, $path);
+                }
+            }
+
+            if ($request->hasFile('lampiran.foto_pengisian_air_tawar')) {
+                $path = $request->file('lampiran.foto_pengisian_air_tawar')
+                    ->store('lampiran-abk', 'public');
+
+                $this->replaceLampiran($laporan, 'foto_pengisian_air_tawar', $path);
+            }
+
+            $this->markSop14Done($patroli);
+            $this->resetStatusJikaPerbaiki($patroli);
+        });
+
+        return redirect()
+            ->route('abk-laporan.edit', $patroli)
+            ->with('success', 'Laporan ABK berhasil disimpan dan SOP 14 diperbarui.');
+    }
+
+    public function export(Patroli $patroli)
+    {
+        $this->ensureCanExport($patroli);
+
+        $patroli->load([
+            'kapal.komandan',
+            'personels',
+            'sopProgress.sop',
+        ]);
+
+        $laporan = AbkLaporan::with([
+            'patroli.kapal.komandan',
+            'patroli.personels',
+            'patroli.sopProgress.sop',
+            'anggarans',
+            'logistiks',
+            'koordinats',
+            'riksaKapals',
+            'lampirans',
+        ])
+            ->where('patroli_id', $patroli->id)
+            ->firstOrFail();
+
+        $mainPdf = Pdf::loadView('abk-laporan.pdf', [
+            'laporan' => $laporan,
+            'patroli' => $patroli,
+            'durasiPelayaran' => $this->hitungDurasiPelayaran($patroli),
+            'timezone' => config('app.timezone', 'Asia/Jakarta'),
+        ])->setPaper('a4', 'portrait');
+
+        $fileName = 'laporan-abk-' . ($patroli->kapal->kode_kapal ?? 'kapal') . '.pdf';
+
+        return $this->downloadMergedPdf(
+            $mainPdf->output(),
+            $laporan,
+            $patroli,
+            $fileName
+        );
+    }
+
+    private function downloadMergedPdf(string $mainPdfContent, AbkLaporan $laporan, Patroli $patroli, string $fileName)
+    {
+        if (! class_exists(Merger::class)) {
+            return response($mainPdfContent, 200, [
+                'Content-Type' => 'application/pdf',
+                'Content-Disposition' => 'attachment; filename="' . $fileName . '"',
+            ]);
+        }
+
+        $tempDir = storage_path('app/temp-pdf');
+
+        if (! is_dir($tempDir)) {
+            mkdir($tempDir, 0775, true);
+        }
+
+        $mainPath = $tempDir . '/laporan-utama-' . $laporan->id . '-' . time() . '.pdf';
+
+        file_put_contents($mainPath, $mainPdfContent);
+
+        $merger = new Merger();
+        $merger->addFile($mainPath);
+
+        foreach ($this->collectLampiranPdfPaths($laporan, $patroli) as $pdfPath) {
+            if (
+                $pdfPath &&
+                file_exists($pdfPath) &&
+                strtolower(pathinfo($pdfPath, PATHINFO_EXTENSION)) === 'pdf'
+            ) {
+                try {
+                    $merger->addFile($pdfPath);
+                } catch (\Throwable $e) {
+                    continue;
+                }
+            }
+        }
+
+        try {
+            $mergedPdf = $merger->merge();
+        } catch (\Throwable $e) {
+            if (file_exists($mainPath)) {
+                unlink($mainPath);
+            }
+
+            return response($mainPdfContent, 200, [
+                'Content-Type' => 'application/pdf',
+                'Content-Disposition' => 'attachment; filename="' . $fileName . '"',
+            ]);
+        }
+
+        if (file_exists($mainPath)) {
+            unlink($mainPath);
+        }
+
+        return response($mergedPdf, 200, [
+            'Content-Type' => 'application/pdf',
+            'Content-Disposition' => 'attachment; filename="' . $fileName . '"',
+        ]);
+    }
+
+    private function collectLampiranPdfPaths(AbkLaporan $laporan, Patroli $patroli): array
+    {
+        $paths = [];
+
+        $sop4 = $patroli->sopProgress
+            ->first(fn ($progress) => optional($progress->sop)->urutan == 4);
+
+        if ($sop4) {
+            if (! empty($sop4->bukti_file)) {
+                $paths[] = $this->publicStoragePath($sop4->bukti_file);
+            }
+
+            if (! empty($sop4->bukti_file_2)) {
+                $paths[] = $this->publicStoragePath($sop4->bukti_file_2);
+            }
+        }
+
+        foreach ($laporan->riksaKapals as $riksa) {
+            if (! empty($riksa->surat_hasil_pemeriksaan)) {
+                $paths[] = $this->publicStoragePath($riksa->surat_hasil_pemeriksaan);
+            }
+        }
+
+        foreach ($this->lampiranPdf as $jenis) {
+            $lampiran = $laporan->lampirans->firstWhere('jenis', $jenis);
+
+            if ($lampiran && ! empty($lampiran->file_path)) {
+                $paths[] = $this->publicStoragePath($lampiran->file_path);
+            }
+        }
+
+        return array_values(array_filter($paths));
+    }
+
+    private function publicStoragePath(?string $path): ?string
+    {
+        if (! $path) {
+            return null;
+        }
+
+        return storage_path('app/public/' . $path);
+    }
+
+    private function syncRiksaKapals(Request $request, AbkLaporan $laporan): void
+    {
+        $existingIds = $laporan->riksaKapals()->pluck('id')->toArray();
+        $incomingIds = [];
+
+        foreach ($request->input('riksa', []) as $index => $item) {
+            if (empty($item['nama_kapal']) && empty($item['nama_nahkoda'])) {
+                continue;
+            }
+
+            $riksa = null;
+
+            if (! empty($item['id'])) {
+                $riksa = $laporan->riksaKapals()
+                    ->where('id', $item['id'])
+                    ->first();
+
+                if ($riksa) {
+                    $incomingIds[] = $riksa->id;
+                }
+            }
+
+            if (! $riksa) {
+                $riksa = new RiksaKapal();
+                $riksa->abk_laporan_id = $laporan->id;
+            }
+
+            $riksa->nama_kapal = $item['nama_kapal'] ?? null;
+            $riksa->nama_nahkoda = $item['nama_nahkoda'] ?? null;
+            $riksa->dari_tujuan = $item['dari_tujuan'] ?? null;
+            $riksa->muatan = $item['muatan'] ?? null;
+            $riksa->titik_koordinat = $item['titik_koordinat'] ?? null;
+            $riksa->kategori = $item['kategori'] ?? 'aman';
+            $riksa->penjelasan = $item['penjelasan'] ?? null;
+
+            if ($request->hasFile("riksa.$index.foto_riksa")) {
+                if ($riksa->foto_riksa) {
+                    Storage::disk('public')->delete($riksa->foto_riksa);
+                }
+
+                $riksa->foto_riksa = $request->file("riksa.$index.foto_riksa")
+                    ->store('riksa/foto-riksa', 'public');
+            }
+
+            if ($request->hasFile("riksa.$index.foto_binluh")) {
+                if ($riksa->foto_binluh) {
+                    Storage::disk('public')->delete($riksa->foto_binluh);
+                }
+
+                $riksa->foto_binluh = $request->file("riksa.$index.foto_binluh")
+                    ->store('riksa/foto-binluh', 'public');
+            }
+
+            if ($request->hasFile("riksa.$index.surat_hasil_pemeriksaan")) {
+                if ($riksa->surat_hasil_pemeriksaan) {
+                    Storage::disk('public')->delete($riksa->surat_hasil_pemeriksaan);
+                }
+
+                $riksa->surat_hasil_pemeriksaan = $request->file("riksa.$index.surat_hasil_pemeriksaan")
+                    ->store('riksa/surat-hasil-pemeriksaan', 'public');
+            }
+
+            $riksa->save();
+
+            if (! in_array($riksa->id, $incomingIds)) {
+                $incomingIds[] = $riksa->id;
+            }
+        }
+
+        $deleteIds = array_diff($existingIds, $incomingIds);
+
+        if (! empty($deleteIds)) {
+            $items = $laporan->riksaKapals()
+                ->whereIn('id', $deleteIds)
+                ->get();
+
+            foreach ($items as $item) {
+                if ($item->foto_riksa) {
+                    Storage::disk('public')->delete($item->foto_riksa);
+                }
+
+                if ($item->foto_binluh) {
+                    Storage::disk('public')->delete($item->foto_binluh);
+                }
+
+                if ($item->surat_hasil_pemeriksaan) {
+                    Storage::disk('public')->delete($item->surat_hasil_pemeriksaan);
+                }
+
+                $item->delete();
+            }
+        }
+    }
+
+    private function ensureAbkCanAccess(Patroli $patroli): void
+    {
+        if (auth()->user()->role !== 'abk') {
+            abort(403, 'Menu laporan ini hanya untuk ABK Kapal.');
+        }
+
+        $isPersonel = $patroli->personels()
+            ->where('users.id', auth()->id())
+            ->exists();
+
+        if (! $isPersonel) {
+            abort(403, 'Anda tidak terdaftar sebagai ABK pada patroli ini.');
+        }
+    }
+
+    private function ensureCanExport(Patroli $patroli): void
+    {
+        $user = auth()->user();
+
+        if (in_array($user->role, ['pimpinan', 'admin'])) {
+            return;
+        }
+
+        if ($user->role === 'komandan') {
+            if ($patroli->kapal && $patroli->kapal->komandan_id === $user->id) {
+                return;
+            }
+
+            abort(403, 'Komandan hanya dapat melihat laporan pada kapal yang ditugaskan.');
+        }
+
+        if ($user->role === 'abk') {
+            $isPersonel = $patroli->personels()
+                ->where('users.id', $user->id)
+                ->exists();
+
+            if ($isPersonel) {
+                return;
+            }
+
+            abort(403, 'Anda tidak terdaftar sebagai ABK pada patroli ini.');
+        }
+
+        abort(403, 'Anda tidak memiliki akses ke laporan ini.');
+    }
+
+    private function replaceLampiran(AbkLaporan $laporan, string $jenis, string $path): void
+    {
+        $old = $laporan->lampirans()
+            ->where('jenis', $jenis)
+            ->first();
+
+        if ($old && $old->file_path) {
+            Storage::disk('public')->delete($old->file_path);
+        }
+
+        $laporan->lampirans()->updateOrCreate(
+            ['jenis' => $jenis],
+            ['file_path' => $path]
+        );
+    }
+
+    private function markSop14Done(Patroli $patroli): void
+    {
+        $progress = $patroli->sopProgress()
+            ->whereHas('sop', fn ($q) => $q->where('urutan', 14))
+            ->first();
+
+        if ($progress) {
+            $progress->update([
+                'status' => 'selesai',
+                'waktu_mulai' => $progress->waktu_mulai ?? now(),
+                'waktu_selesai' => now(),
+                'user_id' => auth()->id(),
+            ]);
+        }
+    }
+
+    private function resetStatusJikaPerbaiki(Patroli $patroli): void
+    {
+        if ($patroli->status === 'perbaiki') {
+            $patroli->update([
+                'status' => 'selesai',
+                'validasi_pimpinan_status' => null,
+                'validasi_pimpinan_user_id' => null,
+                'validasi_pimpinan_at' => null,
+            ]);
+        }
+    }
+
+    private function hitungDurasiPelayaran(Patroli $patroli): string
+    {
+        $sop7 = $patroli->sopProgress()
+            ->whereHas('sop', fn ($q) => $q->where('urutan', 7))
+            ->first();
+
+        $sop13 = $patroli->sopProgress()
+            ->whereHas('sop', fn ($q) => $q->where('urutan', 13))
+            ->first();
+
+        if (! $sop7 || ! $sop7->waktu_selesai || ! $sop13 || ! $sop13->waktu_selesai) {
+            return '-';
+        }
+
+        $start = Carbon::parse($sop7->waktu_selesai)
+            ->timezone(config('app.timezone', 'Asia/Jakarta'));
+
+        $end = Carbon::parse($sop13->waktu_selesai)
+            ->timezone(config('app.timezone', 'Asia/Jakarta'));
+
+        return $start->diffForHumans($end, true);
+    }
+
+    private function key(string $value): string
+    {
+        return strtolower(str_replace([' ', '/', '(', ')'], '_', $value));
+    }
+}
+
+
+abkanevcontroller.php:
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\AbkAnev;
+use App\Models\Patroli;
+use App\Models\User;
+use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+
+class AbkAnevController extends Controller
+{
+    public function index()
+    {
+        if (auth()->user()->role !== 'abk') {
+            abort(403, 'Menu arsip ANEV hanya untuk ABK Kapal.');
+        }
+
+        $anevs = AbkAnev::with(['patroli.kapal', 'pembuatLaporan'])
+            ->where('user_id', auth()->id())
+            ->latest()
+            ->paginate(10);
+
+        return view('abk-anev.index', compact('anevs'));
+    }
+
+    public function edit(Patroli $patroli)
+    {
+        $this->ensureAbkCanAccess($patroli);
+
+        $anev = AbkAnev::firstOrCreate(
+            ['patroli_id' => $patroli->id],
+            [
+                'user_id' => auth()->id(),
+                'status' => 'draft',
+            ]
+        );
+
+        $patroli->load([
+            'kapal.komandan',
+            'personels',
+            'abkLaporan.riksaKapals',
+            'sopProgress.sop',
+        ]);
+
+        $users = User::where('status', 'aktif')
+            ->orderBy('nama')
+            ->get();
+
+        return view('abk-anev.edit', compact('anev', 'patroli', 'users'));
+    }
+
+    public function update(Request $request, Patroli $patroli)
+    {
+        $this->ensureAbkCanAccess($patroli);
+
+        $request->validate([
+            'hambatan' => ['nullable', 'string'],
+            'kendala' => ['nullable', 'string'],
+            'pembuat_laporan_id' => ['required', 'exists:users,id'],
+            'foto_anev' => ['nullable', 'image', 'mimes:jpg,jpeg,png', 'max:5120'],
+        ], [
+            'pembuat_laporan_id.required' => 'Nama pembuat laporan wajib dipilih.',
+            'foto_anev.image' => 'Bukti ANEV harus berupa gambar.',
+            'foto_anev.mimes' => 'Bukti ANEV harus berformat JPG, JPEG, atau PNG.',
+            'foto_anev.max' => 'Ukuran bukti ANEV maksimal 5MB.',
+        ]);
+
+        $anev = AbkAnev::firstOrCreate(
+            ['patroli_id' => $patroli->id],
+            [
+                'user_id' => auth()->id(),
+                'status' => 'draft',
+            ]
+        );
+
+        DB::transaction(function () use ($request, $anev, $patroli) {
+            $data = [
+                'user_id' => auth()->id(),
+                'pembuat_laporan_id' => $request->pembuat_laporan_id,
+                'hambatan' => $request->hambatan,
+                'kendala' => $request->kendala,
+                'status' => 'tersimpan',
+            ];
+
+            if ($request->hasFile('foto_anev')) {
+                if ($anev->foto_anev) {
+                    Storage::disk('public')->delete($anev->foto_anev);
+                }
+
+                $data['foto_anev'] = $request->file('foto_anev')
+                    ->store('anev/foto', 'public');
+            }
+
+            $anev->update($data);
+
+            $this->markSop15Done($patroli);
+
+            $this->resetStatusJikaPerbaiki($patroli);
+        });
+
+        return redirect()
+            ->route('abk-anev.edit', $patroli)
+            ->with('success', 'ANEV berhasil disimpan dan SOP 15 diperbarui.');
+    }
+
+    public function export(Patroli $patroli)
+    {
+        $this->ensureCanExport($patroli);
+
+        $anev = AbkAnev::with([
+            'patroli.kapal.komandan',
+            'patroli.personels',
+            'patroli.abkLaporan.riksaKapals',
+            'pembuatLaporan',
+        ])
+            ->where('patroli_id', $patroli->id)
+            ->firstOrFail();
+
+        $pdf = Pdf::loadView('abk-anev.pdf', [
+            'anev' => $anev,
+            'patroli' => $patroli,
+        ])->setPaper('a4', 'portrait');
+
+        return $pdf->download('anev-abk-' . ($patroli->kapal->kode_kapal ?? 'kapal') . '.pdf');
+    }
+
+    private function ensureAbkCanAccess(Patroli $patroli): void
+    {
+        if (auth()->user()->role !== 'abk') {
+            abort(403, 'Menu ANEV hanya untuk ABK Kapal.');
+        }
+
+        $isPersonel = $patroli->personels()
+            ->where('users.id', auth()->id())
+            ->exists();
+
+        if (! $isPersonel) {
+            abort(403, 'Anda tidak terdaftar sebagai ABK pada patroli ini.');
+        }
+
+        $sop14Selesai = $patroli->sopProgress()
+            ->where('status', 'selesai')
+            ->whereHas('sop', function ($query) {
+                $query->where('urutan', 14);
+            })
+            ->exists();
+
+        if (! $sop14Selesai) {
+            abort(403, 'ANEV baru bisa diisi setelah SOP 14 selesai.');
+        }
+    }
+
+    private function ensureCanExport(Patroli $patroli): void
+    {
+        $user = auth()->user();
+
+        if ($user->role === 'pimpinan') {
+            return;
+        }
+
+        if ($user->role === 'admin') {
+            return;
+        }
+
+        if ($user->role === 'komandan') {
+            if ($patroli->kapal && $patroli->kapal->komandan_id === $user->id) {
+                return;
+            }
+
+            abort(403, 'Komandan hanya dapat melihat ANEV pada kapal yang ditugaskan.');
+        }
+
+        if ($user->role === 'abk') {
+            $isPersonel = $patroli->personels()
+                ->where('users.id', $user->id)
+                ->exists();
+
+            if ($isPersonel) {
+                return;
+            }
+
+            abort(403, 'Anda tidak terdaftar sebagai ABK pada patroli ini.');
+        }
+
+        abort(403, 'Anda tidak memiliki akses ke ANEV ini.');
+    }
+
+    private function markSop15Done(Patroli $patroli): void
+    {
+        $progress = $patroli->sopProgress()
+            ->whereHas('sop', fn ($query) => $query->where('urutan', 15))
+            ->first();
+
+        if ($progress) {
+            $progress->update([
+                'status' => 'selesai',
+                'waktu_mulai' => $progress->waktu_mulai ?? now(),
+                'waktu_selesai' => now(),
+                'user_id' => auth()->id(),
+            ]);
+        }
+    }
+
+    private function resetStatusJikaPerbaiki(Patroli $patroli): void
+    {
+        if ($patroli->status === 'perbaiki') {
+            $patroli->update([
+                'status' => 'selesai',
+                'validasi_pimpinan_status' => null,
+                'validasi_pimpinan_user_id' => null,
+                'validasi_pimpinan_at' => null,
+            ]);
+        }
+    }
+}
+
+
+abklaporan.php:
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class AbkLaporan extends Model
+{
+    protected $fillable = [
+        'patroli_id',
+        'user_id',
+        'total_pengisian_bbm',
+        'total_stock_bbm_tangki',
+        'total_jarak_tempuh',
+        'total_pemakaian_bbm',
+        'pemakaian_bbm_selama_layar',
+        'kecepatan_rata_rata',
+        'sisa_bbm_selesai_patroli',
+        'status',
+        'catatan',
+    ];
+
+    public function patroli()
+    {
+        return $this->belongsTo(Patroli::class);
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    public function anggarans()
+    {
+        return $this->hasMany(AbkAnggaran::class);
+    }
+
+    public function logistiks()
+    {
+        return $this->hasMany(AbkLogistik::class);
+    }
+
+    public function koordinats()
+    {
+        return $this->hasMany(AbkKoordinat::class);
+    }
+
+    public function riksaKapals()
+    {
+        return $this->hasMany(RiksaKapal::class);
+    }
+
+    public function lampirans()
+    {
+        return $this->hasMany(AbkLampiran::class);
+    }
+}
+
+
+abkanev.php:
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class AbkAnev extends Model
+{
+    protected $fillable = [
+        'patroli_id',
+        'user_id',
+        'pembuat_laporan_id',
+        'hambatan',
+        'kendala',
+        'foto_anev',
+        'status',
+    ];
+
+    public function patroli()
+    {
+        return $this->belongsTo(Patroli::class);
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class);
+    }
+
+    public function pembuatLaporan()
+    {
+        return $this->belongsTo(User::class, 'pembuat_laporan_id');
+    }
+
+    public function getFotoAnevUrlAttribute()
+    {
+        if ($this->foto_anev) {
+            return asset('storage/' . $this->foto_anev);
+        }
+
+        return null;
+    }
+}
+
+
+web.php:
+<?php
+
+use App\Http\Controllers\AbkAnevController;
+use App\Http\Controllers\AbkLaporanController;
+use App\Http\Controllers\AuthController;
+use App\Http\Controllers\DashboardController;
+use App\Http\Controllers\KapalController;
+use App\Http\Controllers\PatroliController;
+use App\Http\Controllers\PimpinanValidasiController;
+use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\SopController;
+use App\Http\Controllers\SopProgressController;
+use App\Http\Controllers\UserController;
+use Illuminate\Support\Facades\Route;
+
+Route::get('/', function () {
+    return redirect()->route('login');
+});
+
+/*
+|--------------------------------------------------------------------------
+| Auth Manual NRP + Password
+|--------------------------------------------------------------------------
+| Tidak memakai Breeze dan tidak membutuhkan routes/auth.php.
+*/
+Route::middleware('guest')->group(function () {
+    Route::get('/login', [AuthController::class, 'showLogin'])
+        ->name('login');
+
+    Route::post('/login', [AuthController::class, 'login'])
+        ->name('login.process');
+});
+
+Route::post('/logout', [AuthController::class, 'logout'])
+    ->middleware('auth')
+    ->name('logout');
+
+Route::middleware('auth')->group(function () {
+    /*
+    |--------------------------------------------------------------------------
+    | Dashboard
+    |--------------------------------------------------------------------------
+    */
+    Route::get('/dashboard', DashboardController::class)
+        ->name('dashboard');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Profile / Foto Profil
+    |--------------------------------------------------------------------------
+    */
+    Route::get('/profile', [ProfileController::class, 'show'])
+    ->name('profile.show');
+
+    Route::post('/profile/photo', [ProfileController::class, 'updatePhoto'])
+    ->name('profile.photo.update');
+
+    Route::delete('/profile/photo', [ProfileController::class, 'deletePhoto'])
+    ->name('profile.photo.delete');
+    /*
+    |--------------------------------------------------------------------------
+    | Manajemen User
+    |--------------------------------------------------------------------------
+    | Export PDF harus di atas resource users agar tidak terbaca sebagai {user}.
+    */
+    Route::get('/users/export-pdf', [UserController::class, 'exportPdf'])
+        ->name('users.export-pdf');
+
+    Route::resource('/users', UserController::class)
+        ->except(['show']);
+
+    Route::patch('/users/{user}/toggle-status', [UserController::class, 'toggleStatus'])
+        ->name('users.toggle-status');
+
+    Route::patch('/users/{user}/reset-password', [UserController::class, 'resetPassword'])
+        ->name('users.reset-password');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Master Kapal
+    |--------------------------------------------------------------------------
+    */
+    Route::resource('/kapal', KapalController::class);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Master SOP
+    |--------------------------------------------------------------------------
+    */
+    Route::resource('/sop', SopController::class);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Patroli
+    |--------------------------------------------------------------------------
+    */
+    Route::resource('/patroli', PatroliController::class);
+
+    /*
+    |--------------------------------------------------------------------------
+    | Progress SOP
+    |--------------------------------------------------------------------------
+    */
+    Route::post('/sop-progress/{id}', [SopProgressController::class, 'update'])
+        ->name('sop-progress.update');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Laporan ABK - SOP 14
+    |--------------------------------------------------------------------------
+    */
+    Route::get('/arsip-laporan-abk', [AbkLaporanController::class, 'index'])
+        ->name('abk-laporan.index');
+
+    Route::get('/patroli/{patroli}/laporan-abk', [AbkLaporanController::class, 'edit'])
+        ->name('abk-laporan.edit');
+
+    Route::put('/patroli/{patroli}/laporan-abk', [AbkLaporanController::class, 'update'])
+        ->name('abk-laporan.update');
+
+    Route::get('/patroli/{patroli}/laporan-abk/export', [AbkLaporanController::class, 'export'])
+        ->name('abk-laporan.export');
+
+    /*
+    |--------------------------------------------------------------------------
+    | ANEV ABK - SOP 15
+    |--------------------------------------------------------------------------
+    */
+    Route::get('/arsip-anev-abk', [AbkAnevController::class, 'index'])
+        ->name('abk-anev.index');
+
+    Route::get('/patroli/{patroli}/anev-abk', [AbkAnevController::class, 'edit'])
+        ->name('abk-anev.edit');
+
+    Route::put('/patroli/{patroli}/anev-abk', [AbkAnevController::class, 'update'])
+        ->name('abk-anev.update');
+
+    Route::get('/patroli/{patroli}/anev-abk/export', [AbkAnevController::class, 'export'])
+        ->name('abk-anev.export');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validasi Pimpinan
+    |--------------------------------------------------------------------------
+    */
+    Route::patch('/patroli/{patroli}/validasi-pimpinan/valid', [PimpinanValidasiController::class, 'valid'])
+        ->name('pimpinan.validasi.valid');
+
+    Route::patch('/patroli/{patroli}/validasi-pimpinan/perbaiki', [PimpinanValidasiController::class, 'perbaiki'])
+        ->name('pimpinan.validasi.perbaiki');
+});
